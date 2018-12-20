@@ -13,13 +13,8 @@
 #error This class requires automatic reference counting
 #endif
 
-@interface MMQueuedWormhole ()
-@property (nonatomic, strong) NSMutableSet *pluralListeners;
-@end
 
-
-@implementation MMQueuedWormhole
-
+@implementation MMQueuedWormholeFileTransiting
 #pragma mark - Private File Operation Methods
 
 - (NSInteger)smallestFileNumberForIdentifier:(NSString *)identifier
@@ -108,23 +103,6 @@
     return filePath;
 }
 
-- (void)clearMessageContentsForIdentifier:(NSString *)identifier {
-    if (identifier == nil) {
-        return;
-    }
-    
-    // clear the single file created by base class
-    [super clearMessageContentsForIdentifier:identifier];
-    
-    // delete the queue director for this identifier
-    NSString *directoryPath = [self messagePassingDirectoryPath];
-    NSString *subDirectoryPath = [directoryPath stringByAppendingPathComponent:identifier];
-    if (subDirectoryPath != nil) {
-        [self.fileManager removeItemAtPath:subDirectoryPath error:NULL];
-    }
-}
-
-
 - (NSString *)uniqueFilePathWithinParent:(NSString *)parentPath
 {
     return [parentPath stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
@@ -174,15 +152,13 @@
     return YES;
 }
 
-
 #pragma mark - Overridden Private File Operation Methods
-
-- (void)writeMessageObject:(id)messageObject toFileWithIdentifier:(NSString *)identifier
+- (BOOL)writeMessageObject:(id<NSCoding>)messageObject forIdentifier:(NSString *)identifier
 {
-    [self writeMessageObject:messageObject toFileWithIdentifier:identifier usedFileNumber:NULL];
+    return [self writeMessageObject:messageObject forIdentifier:identifier usedFileNumber:NULL];
 }
 
-- (BOOL)writeMessageObject:(id)messageObject toFileWithIdentifier:(NSString *)identifier usedFileNumber:(NSInteger *)fileNumberPtr
+- (BOOL)writeMessageObject:(id)messageObject forIdentifier:(NSString *)identifier usedFileNumber:(NSInteger *)fileNumberPtr
 {
     if (identifier == nil) {
         return NO;
@@ -217,13 +193,47 @@
         return NO; // any other case of !success
     }
     
-    [self sendNotificationForMessageWithIdentifier:identifier]; // !!! fileNumber:fileNumber
-    
     if (fileNumberPtr) {
         *fileNumberPtr = fileNumber;
     }
     return YES;
 }
+
+- (void)deleteContentForIdentifier:(NSString *)identifier {
+    
+    // clear the single file created by base class
+    [super deleteContentForIdentifier:identifier];
+    
+    // delete the queue director for this identifier
+    NSString *directoryPath = [self messagePassingDirectoryPath];
+    NSString *subDirectoryPath = [directoryPath stringByAppendingPathComponent:identifier];
+    if (subDirectoryPath != nil) {
+        [self.fileManager removeItemAtPath:subDirectoryPath error:NULL];
+    }
+}
+
+@end
+
+@interface MMQueuedWormhole ()
+@property (nonatomic, strong) NSMutableSet *pluralListeners;
+@end
+
+
+@implementation MMQueuedWormhole
+- (instancetype)initWithApplicationGroupIdentifier:(nullable NSString *)identifier
+                                 optionalDirectory:(nullable NSString *)directory {
+    if ((self = [super initWithApplicationGroupIdentifier:identifier
+                                        optionalDirectory:directory]))
+    {
+        
+        self.wormholeMessenger = [[MMQueuedWormholeFileTransiting alloc] initWithApplicationGroupIdentifier:[identifier copy]
+                                                                                    optionalDirectory:[directory copy]];
+    }
+    
+    return self;
+}
+
+#pragma mark - Overridden Private File Operation Methods
 
 
 - (id)messageObjectFromFileWithIdentifier:(NSString *)identifier
@@ -239,10 +249,11 @@
     
     // first attempt to read from single file created by base class, only if its not present do we read from our subdirectory
     NSData *data = nil;
-    NSString *filePath = [self filePathForIdentifier:identifier];
+    NSString *filePath = [(MMQueuedWormholeFileTransiting *) self.wormholeMessenger filePathForIdentifier:identifier];
     BOOL isDir;
-    if (filePath != nil && [self.fileManager fileExistsAtPath:filePath isDirectory:&isDir] && !isDir) {
-        data = [self atomicallyReadAndDeleteFile:filePath error:NULL];
+    NSFileManager *fileManager = ((MMQueuedWormholeFileTransiting *) self.wormholeMessenger).fileManager;
+    if (filePath != nil && [fileManager fileExistsAtPath:filePath isDirectory:&isDir] && !isDir) {
+        data = [(MMQueuedWormholeFileTransiting *) self.wormholeMessenger atomicallyReadAndDeleteFile:filePath error:NULL];
         
         if (data == nil) {
             return nil;
@@ -250,8 +261,8 @@
     }
     
     else {
-        NSInteger fileNumber = [self smallestFileNumberForIdentifier:identifier];
-        filePath = [self filePathForIdentifier:identifier withFileNumber:fileNumber];
+        NSInteger fileNumber = [(MMQueuedWormholeFileTransiting *) self.wormholeMessenger smallestFileNumberForIdentifier:identifier];
+        filePath = [(MMQueuedWormholeFileTransiting *) self.wormholeMessenger filePathForIdentifier:identifier withFileNumber:fileNumber];
         
         if (filePath == nil) {
             return nil;
@@ -259,17 +270,17 @@
         
         while (limitFileNumber < 0 || fileNumber <= limitFileNumber) {
             NSError *error;
-            data = [self atomicallyReadAndDeleteFile:filePath error:&error];
+            data = [(MMQueuedWormholeFileTransiting *) self.wormholeMessenger atomicallyReadAndDeleteFile:filePath error:&error];
             if (data != nil) {
                 break;
             }
             
             // if race between multiple readers and file has already been deleted, then find new smallest number and try again
             if (error.code == 260) {
-                NSInteger updatedFileNumber = [self smallestFileNumberForIdentifier:identifier];
+                NSInteger updatedFileNumber = [(MMQueuedWormholeFileTransiting *) self.wormholeMessenger smallestFileNumberForIdentifier:identifier];
                 if (updatedFileNumber != fileNumber) {
                     fileNumber = updatedFileNumber;
-                    filePath = [self filePathForIdentifier:identifier withFileNumber:updatedFileNumber];
+                    filePath = [(MMQueuedWormholeFileTransiting *) self.wormholeMessenger filePathForIdentifier:identifier withFileNumber:updatedFileNumber];
                     if (filePath != nil) { // don't expect it to be nil
                         continue;
                     }
@@ -285,6 +296,12 @@
     return messageObject;
 }
 
+- (void)clearMessageContentsForIdentifier:(NSString *)identifier {
+    if (identifier == nil) {
+        return;
+    }
+    [self.wormholeMessenger deleteContentForIdentifier:identifier];    
+}
 
 #pragma mark - Private Notification Methods
 
@@ -342,7 +359,7 @@
             
             // if more being posted while this receiver app is running, stop receiving at largest file number determined here
             // not sure if this is worthwhile or not
-            NSInteger limitFileNumber = [self largestFileNumberForIdentifier:identifier];
+            NSInteger limitFileNumber = [(MMQueuedWormholeFileTransiting *)self.wormholeMessenger largestFileNumberForIdentifier:identifier];
             
 //            // if sender using base class and file number not given, there should be only 1 message so call listener with it
 //            // otherwise call listener for any queued messages
@@ -418,7 +435,7 @@
         
         // if more being posted while this receiver app is running, stop receiving at largest file number determined here
         // not sure if this is worthwhile or not
-        NSInteger limitFileNumber = [self largestFileNumberForIdentifier:identifier];
+        NSInteger limitFileNumber = [(MMQueuedWormholeFileTransiting *)self.wormholeMessenger largestFileNumberForIdentifier:identifier];
         
         while (1) {
             id messageObject = [self messageObjectFromFileWithIdentifier:identifier notGreaterThanFileNumber:limitFileNumber];
@@ -449,7 +466,7 @@
         
         // if more being posted while this receiver app is running, stop receiving at largest file number determined here
         // not sure if this is worthwhile or not
-        NSInteger limitFileNumber = [self largestFileNumberForIdentifier:identifier];
+        NSInteger limitFileNumber = [(MMQueuedWormholeFileTransiting *)self.wormholeMessenger largestFileNumberForIdentifier:identifier];
         
         NSMutableArray *messageObjects = [NSMutableArray array];
         
@@ -479,7 +496,7 @@
 
 - (NSArray *)messagesWithIdentifier:(NSString *)identifier
 {
-    NSInteger limitFileNumber = [self largestFileNumberForIdentifier:identifier];
+    NSInteger limitFileNumber = [(MMQueuedWormholeFileTransiting *)self.wormholeMessenger largestFileNumberForIdentifier:identifier];
     
     NSMutableArray *messageObjects = [NSMutableArray array];
     

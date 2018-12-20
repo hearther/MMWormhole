@@ -7,6 +7,7 @@
 //
 
 #import "MMWormhole.h"
+#import "MMWormholeFileTransiting.h"
 
 /**
  This subclass of MMWormhole ensures every message sent to the wormhole will be received in order
@@ -58,4 +59,7 @@
  */
 - (void)stopListeningForMessagesWithIdentifier:(NSString *)identifier;
 
+@end
+
+@interface MMQueuedWormholeFileTransiting : MMWormholeFileTransiting
 @end
